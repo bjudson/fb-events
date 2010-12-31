@@ -1,0 +1,228 @@
+<?php
+
+define('FBC_EVENTS_NO_LOGIN', 0);
+define('FBC_EVENTS_USER_NO_FB', 1);
+define('FBC_EVENTS_NO_FBC', 2);
+define('FBC_EVENTS_NO_UID', 3);
+define('FBC_EVENTS_FULL_CONNECT', 4);
+
+/**
+* Implement hook_menu().
+*/
+function fbconnect_events_menu() {
+	$items = array();
+	$items['admin/settings/fbconnect_events'] = array(
+		'title' => t('FBConnect Events Settings'),
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('fbconnect_events_configure'),
+		'access arguments' => array('administer FBConnect Events'),
+		'type' => MENU_NORMAL_ITEM
+	);
+	return $items;
+}
+
+/**
+ * Implementation of hook_perm().
+ */
+function fbconnect_events_perm() {
+	return array('administer FBConnect Events');
+}
+
+/**
+* Configuration settings form
+*/
+function fbconnect_events_configure() {
+	$form = array();
+	
+	$form['fbconnect_events_show_members'] = array(
+		'#title' => t('Number of attendees'),
+		'#description' => t('How many event attendees to show with event info - set to 0 to not show attendees at all'),
+		'#type' => 'textfield',
+		'#size' => 6,
+		'#default_value' => variable_get('fbconnect_events_show_members', 10)
+	);
+	$form['fbconnect_events_signup_text'] = array(
+		'#title' => t('Sign-up Authorization Text'),
+		'#description' => t('Text to show above the fb button to grant extended permission for RSVPs'),
+		'#type' => 'textfield',
+		'#default_value' => variable_get('fbconnect_events_signup_text', t('Allow @site to sign me up for events', array('@site' => variable_get('site_name', ''))))
+	);
+	return system_settings_form($form);
+}
+
+/**
+ * Implementation of hook_theme().
+ */
+function fbconnect_events_theme($existing, $type, $theme, $path) {
+	return array(
+		'fbconnect_events_main' => array(
+		'template' => 'fbconnect_events_main',
+		'arguments' => array('event_id' => 0, 'fbuid' => 0, 'fbc_status' => FBC_EVENTS_NO_LOGIN, 'members' => array(), 'event_status' => NULL, 'perm_status' => NULL, 'event_form' => array(), 'signup_text' => '', 'total_rsvp' => NULL))
+	);
+}
+
+/**
+ * Implementation of hook_nodeapi().
+ */
+function fbconnect_events_nodeapi(&$node, $op, $arg) {
+	switch ($op) {
+		case 'view':
+			global $user;
+			
+			if ($label = variable_get(FB_CONNECT_VAR_PRIMARY, NULL)) {
+				$primary_app = fb_get_app(array('label' => $label));
+			}
+			
+			// Check that we can create a fbconnect api client object and
+			// have an fbeid field on this node
+			if (!empty($node->field_fbeid) && $fb = fb_api_init($primary_app)) {
+				$eid = $node->field_fbeid[0]['value'];
+			
+				if($fbuid = fb_get_fbu($user->uid)){
+					try {
+						// has this user authorised this app before?
+						$is_app_user = $fb->api(array(
+						'method' => 'users.isAppUser',
+						'uid' => $fbuid));
+					}
+					catch (Exception $e) {
+						watchdog('fbconnect_events', 'Exception thrown while using users_isAppUser: @code, Eid: @eid', array('@code' => $e->getMessage(), '@eid' => $eid), WATCHDOG_WARNING);
+						$is_app_user = 0;
+					}
+				}
+			}
+			
+			// by now we know the status of the user vis-a-vis fb
+			$fbc_status = ($user->uid && $fbuid && $is_app_user) ? FBC_EVENTS_FULL_CONNECT : ($fbuid && $is_app_user ? FBC_EVENTS_NO_UID : ($fbuid ? FBC_EVENTS_NO_FBC : $user->uid ? FBC_EVENTS_USER_NO_FB : FBC_EVENTS_NO_LOGIN));
+			
+			$attending = array();
+			$event_status = $perm_status = NULL;
+			$event_form = array();
+			
+			// TODO: add handling for passing a numeric eid that does 
+			// not correspond to an existing fb event
+			if ($eid && is_numeric($eid)) {
+				$num_members_to_show = variable_get('fbconnect_events_show_members', 10);
+				
+				if ($num_members_to_show) {
+					$members = fbconnect_event_get_members($fb, $eid);
+			
+					if ($members) {
+						$total_rsvp = count($members['data']);
+						shuffle($members['data']);
+						$attending = array_slice($members['data'], 0, 10);
+					}
+				}
+				
+				if ($fbc_status == FBC_EVENTS_FULL_CONNECT) {
+					$my_status = NULL;
+					
+					try {
+					// check whether the user has already authorised the app to RSVP
+					// to FB events
+					$has_granted_perm = $fb->api(array(
+						'method' => 'users.hasAppPermission', 
+						'uid' => $fbuid,
+						'ext_perm' => 'rsvp_event'));
+					}
+					catch (Exception $e) {
+						watchdog('fbconnect_events', 'Exception thrown while using users_hasAppPermission: @code, Eid: @eid', array('@code' => $e->getMessage(), '@eid' => $eid), WATCHDOG_WARNING);
+						$has_granted_perm = 0;
+					}
+					
+					if ($has_granted_perm) {
+						$fql = "SELECT rsvp_status 
+						FROM event_member 
+						WHERE uid = $fbuid
+						AND eid = '$eid'";
+						
+						$my_status = $fb->api(array(
+						'method' => 'fql.query',
+						'query' => $fql));
+						
+						//fb is currently returning 'unsure' from fql query, but wants 'maybe' for graph api status change
+						if($my_status[0]['rsvp_status'] == 'unsure'){
+							$status = 'maybe';
+						}else{
+							$status = $my_status[0]['rsvp_status'];
+						}
+						
+						$event_form = drupal_get_form('fbconnect_events_signup_form', $eid, $fbuid, $status);
+					}
+				}
+			
+				// send everything to our tpl file
+				$output = theme('fbconnect_events_main', $eid, $fbuid, $fbc_status, $attending, $my_status, $has_granted_perm, $event_form, $signup_text, $total_rsvp);
+				
+				// add the themed output to the node content array
+				$node->content['fb_event'] = array(
+				'#value' => $output,
+				'#weight' => 100
+				);
+			}
+		break;
+	}
+}
+
+function fbconnect_events_signup_form($form_state, $eid, $fbuid, $status = NULL) {
+// currently uses ajaxSubmit to submit the form
+// TODO: we could possibly just make this work with built-in ahah
+// Either that or forget about ajax submit, shouldn't have a dependency just for that
+	$form = array(
+		'#redirect' => FALSE,
+		'#ajaxsubmit' => TRUE,
+	);
+	$form['event_status'] = array(
+		'#type' => 'radios',
+		'#options' => fbconnect_events_get_status_options(),
+		'#default_value' => $status,
+	);
+	$form['event_id'] = array(
+		'#type' => 'hidden',
+		'#value' => $eid,
+	);
+	$form['fbuid'] = array(
+		'#type' => 'hidden',
+		'#value' => $fbuid,
+	);
+	$form['submit'] = array(
+		'#type' => 'submit',
+		'#value' => 'RSVP!',
+	);
+	return $form;
+}
+
+function  fbconnect_events_signup_form_submit($form, &$form_state) {
+    if ($label = variable_get(FB_CONNECT_VAR_PRIMARY, NULL)) {
+		$primary_app = fb_get_app(array('label' => $label));
+	}
+
+	if ($fb = fb_api_init($primary_app)) {
+		try {
+			// send the RSVP
+			$status = $fb->api('/'.$form_state['values']['event_id'].'/'.
+			$form_state['values']['event_status'], 'POST', array());
+			if ($status) {
+				drupal_set_message(t('RSVP sent!'), 'status');
+			}
+		}
+		catch (Exception $e) {
+			watchdog('fbconnect_events', 'Exception thrown while using fbconnect_events signup form : @code Eid: @eid', array('@code' => $e->getMessage(), '@eid' => $form_state['values']['event_id']), WATCHDOG_WARNING);
+		}
+	}
+}
+
+function fbconnect_event_get_members($fb, $eid) {
+	try {
+		$members = $fb->api('/'.$eid.'/attending', array('access_token' => fb_access_token($fb)));
+	}
+	catch (Exception $e) {
+		watchdog('fbconnect_events', 'Exception thrown while using fbconnect_event_get_members: @code, Eid: @eid', array('@code' => $e->getMessage(), '@eid' => $eid), WATCHDOG_WARNING);
+	}
+	
+	return $members;
+}
+
+function fbconnect_events_get_status_options() {
+	return array('attending' => t('Attending'), 'maybe' => t('Maybe attending'), 'declined' => t('Not attending'));
+}

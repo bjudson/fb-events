@@ -1,0 +1,11 @@
+; $Id $
+name= Fb Events
+description = FB Events API integration for the Drupal for Facebook module
+core = 6.x
+package = "Facebook connect"
+php = 5.2
+core = "6.x"
+dependencies[] = fb
+dependencies[] = fb_app
+dependencies[] = fb_connect
+
